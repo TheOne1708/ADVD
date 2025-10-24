@@ -13,7 +13,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, root_mean_squared_error
 from sklearn.preprocessing import PolynomialFeatures
 
 
@@ -147,7 +147,8 @@ def fit_and_evaluate(
     ideal_ratio = float(r_range[best_idx])
 
     y_pred = model.predict(x_poly)
-    rmse = float(mean_squared_error(y, y_pred, squared=False))
+    # Use dedicated RMSE to match modern scikit-learn API
+    rmse = float(root_mean_squared_error(y, y_pred))
 
     return model, poly, r_range, vm_pred, best_idx, ideal_ratio, rmse
 
