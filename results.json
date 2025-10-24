@@ -1,0 +1,11 @@
+{
+  "data_source": "synthetic sample",
+  "degree": 3,
+  "vdd": 1.5,
+  "target_vm": 0.75,
+  "ideal_ratio_wn_wp": 3.9230396606209226,
+  "ideal_ratio_wp_wn": 0.25490438193574727,
+  "predicted_vm_at_ideal": 0.7516183509736786,
+  "rmse": 0.019214905585786115,
+  "ridge_alpha": 0.1
+}
