@@ -131,14 +131,18 @@ def load_dataframe(input_path: str) -> pd.DataFrame:
     return df
 
 
-def generate_sample_dataframe(num_rows: int = 80, seed: int = 42) -> pd.DataFrame:
-    """Generate a synthetic dataset that roughly mimics expected behavior."""
+def generate_sample_dataframe(
+    num_rows: int = 80, seed: int = 42, vdd: float = 1.8
+) -> pd.DataFrame:
+    """Generate a synthetic dataset centered around Vm ≈ VDD/2.
+
+    The shape is a smooth nonlinear mapping of Vm vs. Wn/Wp.
+    """
     rng = np.random.default_rng(seed)
     wp = rng.uniform(0.5, 10.0, size=num_rows)
     wn = rng.uniform(0.5, 10.0, size=num_rows)
     ratio = wn / wp
-    # Smooth nonlinear mapping to Vm around ~0.75 V for VDD=1.5 V
-    vm = 0.75 + 0.35 * (ratio - 1.0) - 0.12 * (ratio - 1.0) ** 2
+    vm = (vdd / 2.0) + 0.35 * (ratio - 1.0) - 0.12 * (ratio - 1.0) ** 2
     vm += rng.normal(scale=0.02, size=num_rows)
 
     df = pd.DataFrame({"Wn": wn, "Wp": wp, "Vm": vm})
@@ -245,7 +249,7 @@ def parse_args() -> argparse.Namespace:
         "-d", "--degree", type=int, default=3, help="Polynomial degree (default: 3)"
     )
     parser.add_argument(
-        "--vdd", type=float, default=1.5, help="Supply voltage VDD (default: 1.5 V)"
+        "--vdd", type=float, default=1.8, help="Supply voltage VDD (default: 1.8 V)"
     )
     parser.add_argument(
         "--save-plot",
@@ -336,7 +340,7 @@ def main() -> int:
 
         # Source data
         if args.generate_sample:
-            df = generate_sample_dataframe(seed=args.seed)
+            df = generate_sample_dataframe(seed=args.seed, vdd=args.vdd)
             input_desc = "synthetic sample"
         else:
             input_path = args.input or find_default_input_path()
@@ -346,7 +350,7 @@ def main() -> int:
                     "Falling back to synthetic sample data.",
                     RuntimeWarning,
                 )
-                df = generate_sample_dataframe(seed=args.seed)
+                df = generate_sample_dataframe(seed=args.seed, vdd=args.vdd)
                 input_desc = "synthetic sample"
             else:
                 df = load_dataframe(input_path)
