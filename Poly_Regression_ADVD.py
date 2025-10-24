@@ -1,7 +1,13 @@
+from __future__ import annotations
+
 import argparse
+import json
+import logging
 import os
 import sys
 import warnings
+from dataclasses import dataclass
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
@@ -12,9 +18,35 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, root_mean_squared_error
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import PolynomialFeatures
+
+
+def _compute_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Return RMSE with broad scikit-learn compatibility.
+
+    Prefer sklearn's root_mean_squared_error when available; otherwise
+    fall back to sqrt(mean_squared_error).
+    """
+    try:
+        # Available in scikit-learn >= 1.4
+        from sklearn.metrics import root_mean_squared_error as rmse_fn  # type: ignore
+
+        return float(rmse_fn(y_true, y_pred))
+    except Exception:
+        return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+@dataclass
+class FitResults:
+    model: LinearRegression | Ridge
+    poly: PolynomialFeatures
+    ratio_range: np.ndarray
+    vm_predicted: np.ndarray
+    best_index: int
+    ideal_ratio: float
+    rmse: float
 
 
 def find_default_input_path() -> str | None:
@@ -115,27 +147,25 @@ def generate_sample_dataframe(num_rows: int = 80, seed: int = 42) -> pd.DataFram
 
 
 def fit_and_evaluate(
-    df: pd.DataFrame, degree: int, vdd: float
-) -> tuple[
-    LinearRegression,
-    PolynomialFeatures,
-    np.ndarray,
-    np.ndarray,
-    int,
-    float,
-    float,
-]:
+    df: pd.DataFrame,
+    degree: int,
+    vdd: float,
+    ridge_alpha: float = 0.0,
+) -> FitResults:
     """Fit polynomial regression and compute predictions and metrics.
 
-    Returns: (model, poly, r_range, vm_pred, best_idx, ideal_ratio, rmse)
+    Uses LinearRegression by default; when ridge_alpha > 0, uses Ridge.
     """
-    x = df[["Ratio_WnWp" ]].to_numpy()
+    x = df[["Ratio_WnWp"]].to_numpy()
     y = df["Vm"].to_numpy()
 
     poly = PolynomialFeatures(degree=degree, include_bias=False)
     x_poly = poly.fit_transform(x)
 
-    model = LinearRegression()
+    if ridge_alpha and ridge_alpha > 0:
+        model: LinearRegression | Ridge = Ridge(alpha=ridge_alpha)
+    else:
+        model = LinearRegression()
     model.fit(x_poly, y)
 
     vm_target = vdd / 2.0
@@ -147,21 +177,27 @@ def fit_and_evaluate(
     ideal_ratio = float(r_range[best_idx])
 
     y_pred = model.predict(x_poly)
-    # Use dedicated RMSE to match modern scikit-learn API
-    rmse = float(root_mean_squared_error(y, y_pred))
+    rmse = _compute_rmse(y, y_pred)
 
-    return model, poly, r_range, vm_pred, best_idx, ideal_ratio, rmse
+    return FitResults(
+        model=model,
+        poly=poly,
+        ratio_range=r_range,
+        vm_predicted=vm_pred,
+        best_index=best_idx,
+        ideal_ratio=ideal_ratio,
+        rmse=rmse,
+    )
 
 
 def plot_results(
     df: pd.DataFrame,
-    r_range: np.ndarray,
-    vm_pred: np.ndarray,
-    ideal_ratio: float,
+    results: FitResults,
     degree: int,
     vdd: float,
     save_path: str,
     show: bool = False,
+    dpi: int = 150,
 ) -> str:
     """Create and save the plot, optionally showing it interactively."""
     vm_target = vdd / 2.0
@@ -170,16 +206,14 @@ def plot_results(
         df["Ratio_WnWp"], df["Vm"], color="blue", alpha=0.85, label="Measured Data"
     )
     plt.plot(
-        r_range,
-        vm_pred,
+        results.ratio_range,
+        results.vm_predicted,
         color="red",
         linewidth=2.0,
         label=f"Polynomial Fit (deg={degree})",
     )
     plt.axhline(vm_target, color="green", linestyle="--", label="Vm = VDD/2")
-    plt.axvline(
-        ideal_ratio, color="orange", linestyle="--", label=f"Ideal Ratio = {ideal_ratio:.3f}"
-    )
+    plt.axvline(results.ideal_ratio, color="orange", linestyle="--", label=f"Ideal Ratio = {results.ideal_ratio:.3f}")
     plt.xlabel("Wn / Wp Ratio")
     plt.ylabel("Vm (V)")
     plt.title("Polynomial Regression for Vm vs (Wn/Wp)")
@@ -190,7 +224,7 @@ def plot_results(
     save_dir = os.path.dirname(save_path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(save_path, dpi=150)
+    plt.savefig(save_path, dpi=dpi)
     if show:
         # In headless environments this may still be ignored
         plt.show()
@@ -219,6 +253,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to save the plot image (default: ./poly_fit.png)",
     )
     parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Skip plot creation and saving",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="Show the plot interactively (may not work headlessly)",
@@ -228,59 +267,135 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use synthetic data instead of reading a file",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for synthetic data generation (default: 42)",
+    )
+    parser.add_argument(
+        "--output-json",
+        help="If set, write summary results to this JSON path",
+    )
+    parser.add_argument(
+        "--ridge-alpha",
+        type=float,
+        default=0.0,
+        help="Use Ridge regression with the given alpha (>0 to enable)",
+    )
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging",
+    )
+    verbosity.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Reduce output to warnings and errors",
+    )
     return parser.parse_args()
+
+
+def _configure_logging(verbose: bool, quiet: bool) -> None:
+    if quiet:
+        level = logging.WARNING
+    elif verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logging.basicConfig(level=level, format="%(message)s")
+
+
+def _summarize_results(input_desc: str, args: argparse.Namespace, results: FitResults) -> Dict[str, Any]:
+    vm_at_best = float(results.vm_predicted[results.best_index])
+    reciprocal = float("inf") if results.ideal_ratio == 0 else (1.0 / results.ideal_ratio)
+    return {
+        "data_source": input_desc,
+        "degree": int(args.degree),
+        "vdd": float(args.vdd),
+        "target_vm": float(args.vdd / 2.0),
+        "ideal_ratio_wn_wp": float(results.ideal_ratio),
+        "ideal_ratio_wp_wn": float(reciprocal),
+        "predicted_vm_at_ideal": float(vm_at_best),
+        "rmse": float(results.rmse),
+        "ridge_alpha": float(args.ridge_alpha),
+    }
 
 
 def main() -> int:
     args = parse_args()
+    _configure_logging(verbose=args.verbose, quiet=args.quiet)
 
-    # Source data
-    if args.generate_sample:
-        df = generate_sample_dataframe()
-        input_desc = "synthetic sample"
-    else:
-        input_path = args.input or find_default_input_path()
-        if input_path is None:
-            warnings.warn(
-                "No input file provided and no default file found. "
-                "Falling back to synthetic sample data.",
-                RuntimeWarning,
-            )
-            df = generate_sample_dataframe()
+    try:
+        # Sanity checks
+        if args.degree < 1:
+            raise ValueError("Polynomial degree must be >= 1")
+
+        # Source data
+        if args.generate_sample:
+            df = generate_sample_dataframe(seed=args.seed)
             input_desc = "synthetic sample"
         else:
-            df = load_dataframe(input_path)
-            input_desc = input_path
+            input_path = args.input or find_default_input_path()
+            if input_path is None:
+                warnings.warn(
+                    "No input file provided and no default file found. "
+                    "Falling back to synthetic sample data.",
+                    RuntimeWarning,
+                )
+                df = generate_sample_dataframe(seed=args.seed)
+                input_desc = "synthetic sample"
+            else:
+                df = load_dataframe(input_path)
+                input_desc = input_path
 
-    model, poly, r_range, vm_pred, idx, ideal_ratio, rmse = fit_and_evaluate(
-        df=df, degree=args.degree, vdd=args.vdd
-    )
+        results = fit_and_evaluate(
+            df=df, degree=args.degree, vdd=args.vdd, ridge_alpha=args.ridge_alpha
+        )
 
-    vm_at_best = float(vm_pred[idx])
-    reciprocal = float("inf") if ideal_ratio == 0 else (1.0 / ideal_ratio)
+        summary = _summarize_results(input_desc=input_desc, args=args, results=results)
 
-    # Output results
-    print("=== Polynomial Regression Results ===")
-    print(f"Data source: {input_desc}")
-    print(f"Polynomial degree: {args.degree}")
-    print(f"VDD: {args.vdd:.4f} V (target Vm = {args.vdd/2.0:.4f} V)")
-    print(f"Ideal Wn/Wp = {ideal_ratio:.6f}")
-    print(f"Ideal Wp/Wn = {reciprocal:.6f}")
-    print(f"Predicted Vm at ideal ratio = {vm_at_best:.6f} V")
-    print(f"Model RMSE: {rmse:.6f} V")
+        logging.info("=== Polynomial Regression Results ===")
+        logging.info(f"Data source: {summary['data_source']}")
+        logging.info(f"Polynomial degree: {summary['degree']}")
+        logging.info(
+            f"VDD: {summary['vdd']:.4f} V (target Vm = {summary['target_vm']:.4f} V)"
+        )
+        logging.info(f"Ideal Wn/Wp = {summary['ideal_ratio_wn_wp']:.6f}")
+        logging.info(f"Ideal Wp/Wn = {summary['ideal_ratio_wp_wn']:.6f}")
+        logging.info(
+            f"Predicted Vm at ideal ratio = {summary['predicted_vm_at_ideal']:.6f} V"
+        )
+        logging.info(f"Model RMSE: {summary['rmse']:.6f} V")
 
-    save_path = plot_results(
-        df=df,
-        r_range=r_range,
-        vm_pred=vm_pred,
-        ideal_ratio=ideal_ratio,
-        degree=args.degree,
-        vdd=args.vdd,
-        save_path=args.save_plot,
-        show=args.show,
-    )
-    print(f"Plot written to: {save_path}")
-    return 0
+        if args.output_json:
+            out_dir = os.path.dirname(args.output_json)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(args.output_json, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+            logging.info(f"Results JSON written to: {args.output_json}")
+
+        if not args.no_plot:
+            save_path = plot_results(
+                df=df,
+                results=results,
+                degree=args.degree,
+                vdd=args.vdd,
+                save_path=args.save_plot,
+                show=args.show,
+            )
+            logging.info(f"Plot written to: {save_path}")
+        else:
+            logging.debug("Skipping plot creation due to --no-plot")
+
+        return 0
+    except Exception as exc:  # pylint: disable=broad-except
+        logging.error(f"Error: {exc}")
+        return 1
 
 
 if __name__ == "__main__":
