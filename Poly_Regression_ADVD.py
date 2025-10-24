@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import warnings
+from typing import Iterable, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,9 +13,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, root_mean_squared_error
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, HuberRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 
 
 def find_default_input_path() -> str | None:
@@ -114,43 +117,270 @@ def generate_sample_dataframe(num_rows: int = 80, seed: int = 42) -> pd.DataFram
     return df
 
 
+def _compute_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute RMSE with fallback for older sklearn versions."""
+    # Prefer dedicated RMSE metric when available
+    try:  # sklearn >= 1.4
+        from sklearn.metrics import root_mean_squared_error as _sk_rmse  # type: ignore
+
+        return float(_sk_rmse(y_true, y_pred))
+    except Exception:
+        return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def _augment_with_anchor(
+    x: np.ndarray,
+    y: np.ndarray,
+    vm_target: float,
+    anchor_ratio: float,
+    repeats: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if repeats <= 0:
+        return x, y
+    anchor_x = np.full((repeats, 1), anchor_ratio, dtype=float)
+    anchor_y = np.full((repeats,), vm_target, dtype=float)
+    x_aug = np.concatenate([x, anchor_x], axis=0)
+    y_aug = np.concatenate([y, anchor_y], axis=0)
+    return x_aug, y_aug
+
+
+def _build_pipeline(
+    degree: int,
+    regularization: Literal["none", "ridge", "lasso"],
+    alpha: float,
+    robust: bool,
+) -> Pipeline:
+    if robust:
+        estimator = HuberRegressor(alpha=alpha)
+    else:
+        if regularization == "ridge":
+            estimator = Ridge(alpha=alpha)
+        elif regularization == "lasso":
+            estimator = Lasso(alpha=alpha, max_iter=10000)
+        else:
+            estimator = LinearRegression()
+
+    pipeline = Pipeline(
+        steps=[
+            ("poly", PolynomialFeatures(degree=degree, include_bias=False)),
+            ("scale", StandardScaler()),
+            ("model", estimator),
+        ]
+    )
+    return pipeline
+
+
+def _kfold_rmse(
+    x: np.ndarray,
+    y: np.ndarray,
+    degree: int,
+    regularization: Literal["none", "ridge", "lasso"],
+    alpha: float,
+    robust: bool,
+    k_folds: int,
+    random_state: int,
+    vm_target: Optional[float] = None,
+    anchor_ratio: float = 1.0,
+    anchor_repeats: int = 0,
+) -> float:
+    kf = KFold(n_splits=max(2, k_folds), shuffle=True, random_state=random_state)
+    rmses: list[float] = []
+    for train_idx, test_idx in kf.split(x):
+        x_train, y_train = x[train_idx], y[train_idx]
+        x_test, y_test = x[test_idx], y[test_idx]
+
+        if vm_target is not None and anchor_repeats > 0:
+            x_train, y_train = _augment_with_anchor(
+                x_train, y_train, vm_target=vm_target, anchor_ratio=anchor_ratio, repeats=anchor_repeats
+            )
+
+        pipe = _build_pipeline(
+            degree=degree,
+            regularization=regularization,
+            alpha=alpha,
+            robust=robust,
+        )
+        pipe.fit(x_train, y_train)
+        y_pred = pipe.predict(x_test)
+        rmses.append(_compute_rmse(y_test, y_pred))
+    return float(np.mean(rmses))
+
+
+def _auto_select_degree(
+    x: np.ndarray,
+    y: np.ndarray,
+    degree_min: int,
+    degree_max: int,
+    regularization: Literal["none", "ridge", "lasso"],
+    alpha: float,
+    robust: bool,
+    k_folds: int,
+    random_state: int,
+    vm_target: Optional[float] = None,
+    anchor_ratio: float = 1.0,
+    anchor_repeats: int = 0,
+) -> Tuple[int, float]:
+    """Return (best_degree, cv_rmse)."""
+    degrees = list(range(max(1, degree_min), max(degree_min, degree_max) + 1))
+    best_deg = degrees[0]
+    best_rmse = float("inf")
+    for deg in degrees:
+        cv_rmse = _kfold_rmse(
+            x=x,
+            y=y,
+            degree=deg,
+            regularization=regularization,
+            alpha=alpha,
+            robust=robust,
+            k_folds=k_folds,
+            random_state=random_state,
+            vm_target=vm_target,
+            anchor_ratio=anchor_ratio,
+            anchor_repeats=anchor_repeats,
+        )
+        if cv_rmse < best_rmse:
+            best_rmse = cv_rmse
+            best_deg = deg
+    return best_deg, best_rmse
+
+
 def fit_and_evaluate(
-    df: pd.DataFrame, degree: int, vdd: float
+    df: pd.DataFrame,
+    degree: int,
+    vdd: float,
+    *,
+    auto_degree: bool = False,
+    degree_min: int = 2,
+    degree_max: int = 6,
+    regularization: Literal["none", "ridge", "lasso"] = "none",
+    alpha: float = 1.0,
+    robust: bool = False,
+    anchor_midpoint: bool = False,
+    anchor_repeats: int = 0,
+    k_folds: int = 5,
+    random_state: int = 42,
+    bootstrap: int = 0,
+    ci_alpha: float = 0.05,
 ) -> tuple[
-    LinearRegression,
+    Pipeline,
     PolynomialFeatures,
     np.ndarray,
     np.ndarray,
     int,
     float,
     float,
+    float,
+    float,
+    Optional[float],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
 ]:
-    """Fit polynomial regression and compute predictions and metrics.
+    """Fit a (robust/regularized) polynomial regression and compute diagnostics.
 
-    Returns: (model, poly, r_range, vm_pred, best_idx, ideal_ratio, rmse)
+    Returns:
+        (pipeline, poly, r_range, vm_pred, best_idx, ideal_ratio,
+         rmse, r2, mae, cv_rmse, vm_ci_low, vm_ci_high)
     """
-    x = df[["Ratio_WnWp" ]].to_numpy()
-    y = df["Vm"].to_numpy()
+    x = df[["Ratio_WnWp"]].to_numpy(dtype=float)
+    y = df["Vm"].to_numpy(dtype=float)
 
-    poly = PolynomialFeatures(degree=degree, include_bias=False)
-    x_poly = poly.fit_transform(x)
+    vm_target = float(vdd) / 2.0
+    anchor_ratio = 1.0
 
-    model = LinearRegression()
-    model.fit(x_poly, y)
+    # Auto-select degree if requested
+    selected_degree = degree
+    cv_rmse: Optional[float] = None
+    if auto_degree:
+        selected_degree, cv_rmse = _auto_select_degree(
+            x=x,
+            y=y,
+            degree_min=degree_min,
+            degree_max=degree_max,
+            regularization=regularization,
+            alpha=alpha,
+            robust=robust,
+            k_folds=k_folds,
+            random_state=random_state,
+            vm_target=vm_target if anchor_midpoint else None,
+            anchor_ratio=anchor_ratio,
+            anchor_repeats=anchor_repeats if anchor_midpoint else 0,
+        )
 
-    vm_target = vdd / 2.0
+    # Build and fit final pipeline
+    pipe = _build_pipeline(
+        degree=selected_degree,
+        regularization=regularization,
+        alpha=alpha,
+        robust=robust,
+    )
+
+    x_train, y_train = x, y
+    if anchor_midpoint and anchor_repeats > 0:
+        x_train, y_train = _augment_with_anchor(
+            x, y, vm_target=vm_target, anchor_ratio=anchor_ratio, repeats=anchor_repeats
+        )
+
+    pipe.fit(x_train, y_train)
+
+    # Prediction grid and curve
     r_range = np.linspace(df["Ratio_WnWp"].min(), df["Ratio_WnWp"].max(), 500)
-    r_poly = poly.transform(r_range.reshape(-1, 1))
-    vm_pred = model.predict(r_poly)
+    vm_pred = pipe.predict(r_range.reshape(-1, 1))
 
+    # Ideal ratio where Vm closest to VDD/2
     best_idx = int(np.argmin(np.abs(vm_pred - vm_target)))
     ideal_ratio = float(r_range[best_idx])
 
-    y_pred = model.predict(x_poly)
-    # Use dedicated RMSE to match modern scikit-learn API
-    rmse = float(root_mean_squared_error(y, y_pred))
+    # In-sample metrics
+    y_fit = pipe.predict(x)
+    rmse = _compute_rmse(y, y_fit)
+    r2 = float(r2_score(y, y_fit))
+    mae = float(mean_absolute_error(y, y_fit))
 
-    return model, poly, r_range, vm_pred, best_idx, ideal_ratio, rmse
+    # Bootstrap confidence intervals for the curve (optional)
+    vm_ci_low: Optional[np.ndarray] = None
+    vm_ci_high: Optional[np.ndarray] = None
+    if bootstrap and bootstrap > 0:
+        rng = np.random.default_rng(random_state)
+        preds = np.empty((bootstrap, r_range.shape[0]), dtype=float)
+        n = x.shape[0]
+        for b in range(bootstrap):
+            idx = rng.integers(0, n, size=n)
+            x_b = x[idx]
+            y_b = y[idx]
+            if anchor_midpoint and anchor_repeats > 0:
+                x_b, y_b = _augment_with_anchor(
+                    x_b, y_b, vm_target=vm_target, anchor_ratio=anchor_ratio, repeats=anchor_repeats
+                )
+            p = _build_pipeline(
+                degree=selected_degree,
+                regularization=regularization,
+                alpha=alpha,
+                robust=robust,
+            )
+            p.fit(x_b, y_b)
+            preds[b, :] = p.predict(r_range.reshape(-1, 1))
+        lower_q = 100.0 * (ci_alpha / 2.0)
+        upper_q = 100.0 * (1.0 - ci_alpha / 2.0)
+        vm_ci_low = np.percentile(preds, lower_q, axis=0)
+        vm_ci_high = np.percentile(preds, upper_q, axis=0)
+
+    # Expose the PolynomialFeatures for compatibility
+    poly: PolynomialFeatures = pipe.named_steps["poly"]
+
+    return (
+        pipe,
+        poly,
+        r_range,
+        vm_pred,
+        best_idx,
+        ideal_ratio,
+        rmse,
+        r2,
+        mae,
+        cv_rmse,
+        vm_ci_low,
+        vm_ci_high,
+    )
 
 
 def plot_results(
@@ -162,6 +392,8 @@ def plot_results(
     vdd: float,
     save_path: str,
     show: bool = False,
+    vm_ci_low: Optional[np.ndarray] = None,
+    vm_ci_high: Optional[np.ndarray] = None,
 ) -> str:
     """Create and save the plot, optionally showing it interactively."""
     vm_target = vdd / 2.0
@@ -169,6 +401,16 @@ def plot_results(
     plt.scatter(
         df["Ratio_WnWp"], df["Vm"], color="blue", alpha=0.85, label="Measured Data"
     )
+    # Confidence band if provided
+    if vm_ci_low is not None and vm_ci_high is not None:
+        plt.fill_between(
+            r_range,
+            vm_ci_low,
+            vm_ci_high,
+            color="red",
+            alpha=0.15,
+            label="Bootstrap CI",
+        )
     plt.plot(
         r_range,
         vm_pred,
@@ -214,6 +456,80 @@ def parse_args() -> argparse.Namespace:
         "--vdd", type=float, default=1.5, help="Supply voltage VDD (default: 1.5 V)"
     )
     parser.add_argument(
+        "--auto-degree",
+        action="store_true",
+        help="Select degree via K-fold CV over [--degree-min, --degree-max]",
+    )
+    parser.add_argument(
+        "--degree-min",
+        type=int,
+        default=2,
+        help="Minimum polynomial degree to consider for auto tuning (default: 2)",
+    )
+    parser.add_argument(
+        "--degree-max",
+        type=int,
+        default=6,
+        help="Maximum polynomial degree to consider for auto tuning (default: 6)",
+    )
+    parser.add_argument(
+        "--regularization",
+        choices=["none", "ridge", "lasso"],
+        default="none",
+        help="Regularization type (default: none)",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=1.0,
+        help="Regularization strength for ridge/lasso or Huber (default: 1.0)",
+    )
+    parser.add_argument(
+        "--robust",
+        action="store_true",
+        help="Use HuberRegressor for robust fitting (overrides regularization choice)",
+    )
+    parser.add_argument(
+        "--anchor-midpoint",
+        action="store_true",
+        help="Add repeated pseudo-observations at ratio=1 with Vm=VDD/2",
+    )
+    parser.add_argument(
+        "--anchor-repeats",
+        type=int,
+        default=0,
+        help="How many anchor repeats to add if --anchor-midpoint is set (default: 0)",
+    )
+    parser.add_argument(
+        "--kfolds",
+        type=int,
+        default=5,
+        help="K for K-fold cross validation (default: 5)",
+    )
+    parser.add_argument(
+        "--random-state",
+        type=int,
+        default=42,
+        help="Random seed for CV and bootstrapping (default: 42)",
+    )
+    parser.add_argument(
+        "--bootstrap",
+        type=int,
+        default=0,
+        help="Number of bootstrap resamples for CI band (default: 0 = disabled)",
+    )
+    parser.add_argument(
+        "--ci-alpha",
+        type=float,
+        default=0.05,
+        help="Two-sided CI alpha for bootstrap band (default: 0.05 => 95% CI)",
+    )
+    parser.add_argument(
+        "--report-cv",
+        action="store_true",
+        help="Always report CV RMSE for the selected degree",
+    )
+    parser.add_argument(
         "--save-plot",
         default=os.path.join(os.getcwd(), "poly_fit.png"),
         help="Path to save the plot image (default: ./poly_fit.png)",
@@ -252,32 +568,93 @@ def main() -> int:
             df = load_dataframe(input_path)
             input_desc = input_path
 
-    model, poly, r_range, vm_pred, idx, ideal_ratio, rmse = fit_and_evaluate(
-        df=df, degree=args.degree, vdd=args.vdd
+    (
+        pipe,
+        poly,
+        r_range,
+        vm_pred,
+        idx,
+        ideal_ratio,
+        rmse,
+        r2,
+        mae,
+        cv_rmse,
+        vm_ci_low,
+        vm_ci_high,
+    ) = fit_and_evaluate(
+        df=df,
+        degree=args.degree,
+        vdd=args.vdd,
+        auto_degree=args.auto_degree,
+        degree_min=args.degree_min,
+        degree_max=args.degree_max,
+        regularization=args.regularization,
+        alpha=args.alpha,
+        robust=args.robust,
+        anchor_midpoint=args.anchor_midpoint,
+        anchor_repeats=args.anchor_repeats,
+        k_folds=args.kfolds,
+        random_state=args.random_state,
+        bootstrap=args.bootstrap,
+        ci_alpha=args.ci_alpha,
     )
 
+    # Derived values
     vm_at_best = float(vm_pred[idx])
     reciprocal = float("inf") if ideal_ratio == 0 else (1.0 / ideal_ratio)
+    selected_degree = int(poly.degree)  # type: ignore[attr-defined]
 
     # Output results
     print("=== Polynomial Regression Results ===")
     print(f"Data source: {input_desc}")
-    print(f"Polynomial degree: {args.degree}")
+    print(
+        f"Polynomial degree: {selected_degree}" + (" (auto-selected)" if args.auto_degree else "")
+    )
+    reg_desc = "Huber (robust)" if args.robust else (
+        "Ridge" if args.regularization == "ridge" else ("Lasso" if args.regularization == "lasso" else "LinearRegression")
+    )
+    if args.robust or args.regularization in {"ridge", "lasso"}:
+        print(f"Estimator: {reg_desc} (alpha={args.alpha})")
+    else:
+        print(f"Estimator: {reg_desc}")
+    if args.anchor_midpoint and args.anchor_repeats > 0:
+        print(f"Anchor: ratio=1.0 -> Vm=VDD/2 repeated {args.anchor_repeats}x")
     print(f"VDD: {args.vdd:.4f} V (target Vm = {args.vdd/2.0:.4f} V)")
     print(f"Ideal Wn/Wp = {ideal_ratio:.6f}")
     print(f"Ideal Wp/Wn = {reciprocal:.6f}")
     print(f"Predicted Vm at ideal ratio = {vm_at_best:.6f} V")
-    print(f"Model RMSE: {rmse:.6f} V")
+    print(f"Train RMSE: {rmse:.6f} V | R2: {r2:.4f} | MAE: {mae:.6f} V")
+    if args.auto_degree or args.report_cv:
+        if cv_rmse is None:
+            # Ensure CV reported for the selected degree
+            x = df[["Ratio_WnWp"]].to_numpy(dtype=float)
+            y = df["Vm"].to_numpy(dtype=float)
+            cv_rmse = _kfold_rmse(
+                x=x,
+                y=y,
+                degree=selected_degree,
+                regularization=args.regularization,
+                alpha=args.alpha,
+                robust=args.robust,
+                k_folds=args.kfolds,
+                random_state=args.random_state,
+                vm_target=(args.vdd/2.0) if args.anchor_midpoint else None,
+                anchor_ratio=1.0,
+                anchor_repeats=args.anchor_repeats if args.anchor_midpoint else 0,
+            )
+        print(f"CV RMSE ({args.kfolds}-fold): {cv_rmse:.6f} V")
 
     save_path = plot_results(
         df=df,
         r_range=r_range,
         vm_pred=vm_pred,
         ideal_ratio=ideal_ratio,
-        degree=args.degree,
+        degree=selected_degree,
         vdd=args.vdd,
         save_path=args.save_plot,
         show=args.show,
+        vm_ci_low=vm_ci_low,
+        vm_ci_high=vm_ci_high,
     )
     print(f"Plot written to: {save_path}")
     return 0
